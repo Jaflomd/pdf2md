@@ -11,7 +11,7 @@
 La app ahora tiene dos modos:
 
 - CLI para procesos locales y automatizables
-- UI web con subida de archivo y descarga directa del Markdown o del bundle `.zip`
+- UI web minimalista para alumnos con subida de `PDF` y descarga directa del Markdown o del bundle `.zip`
 
 Todo corre localmente, sin llamadas LLM ni OCR en v1.
 
@@ -42,15 +42,17 @@ También puedes usar el entrypoint:
 pdf2md-web
 ```
 
-La interfaz permite:
+La interfaz online está pensada para un flujo corto:
 
-- subir un documento
-- elegir el engine
-- activar `Fast Mode` para dividir el documento cada `N` páginas
-- ajustar chunk target y overlap
+- subir un `PDF`
+- elegir si quieres priorizar `document.md` o el bundle `.zip`
+- dividir el bundle cada `N` páginas
 - previsualizar `document.md`
 - descargar `document.md`
+- descargar un bloque individual
 - descargar todo el bundle generado en `.zip`
+
+La web fuerza `Fast Mode` con `pymupdf4llm` para priorizar velocidad y una UX más predecible. El CLI mantiene los otros formatos y engines.
 
 ## CLI
 
@@ -87,4 +89,23 @@ Opciones principales:
 
 ## Publicarlo desde GitHub
 
-El repo queda listo para subirse a GitHub. Si quieres que además quede live como app interactiva, el siguiente paso natural es conectarlo a Streamlit Community Cloud o Render usando este mismo repo.
+Para la versión live en Streamlit Community Cloud este repo ya quedó preparado con:
+
+- `app.py` listo para correr sin instalación editable del paquete
+- `requirements.txt` para que Community Cloud instale dependencias Python desde GitHub
+- `.streamlit/config.toml` con base dark
+
+Pasos:
+
+1. Entra a [share.streamlit.io](https://share.streamlit.io/).
+2. Conecta tu cuenta de GitHub si todavía no lo has hecho.
+3. Crea una app nueva apuntando a este repo público: [github.com/Jaflomd/pdf2md](https://github.com/Jaflomd/pdf2md)
+4. Usa `main` como branch y `app.py` como archivo principal.
+
+Según la documentación oficial de Streamlit Community Cloud, las apps se despliegan desde GitHub y normalmente quedan con una URL `*.streamlit.app`. También recomiendan usar `requirements.txt` para dependencias y exigen permisos admin sobre el repo al desplegar.
+
+Fuentes:
+
+- [Deploy your app on Community Cloud](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy)
+- [App dependencies for your Community Cloud app](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/app-dependencies)
+- [Connect your GitHub account](https://docs.streamlit.io/deploy/streamlit-community-cloud/get-started/connect-your-github-account)

@@ -1,0 +1,5 @@
+streamlit>=1.45.0
+pymupdf>=1.27.2.2
+pymupdf4llm>=1.27.2.2
+python-slugify>=8.0.4
+tiktoken>=0.12.0
