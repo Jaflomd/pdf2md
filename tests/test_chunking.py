@@ -1,7 +1,8 @@
-from pdf2md.pipeline import _build_chunks_for_chapter, _split_markdown_blocks, Chapter
+from pdf2md import pipeline
+from pdf2md.pipeline import Chapter, _build_chunks_for_chapter, _split_markdown_blocks
 
 
-def test_split_markdown_blocks_preserves_tables_and_code():
+def test_split_markdown_blocks_preserves_tables_and_code() -> None:
     markdown = """
 # Chapter 1
 
@@ -24,7 +25,7 @@ print("hello")
     assert blocks[0].kind == "heading"
 
 
-def test_chunk_builder_keeps_overlap_and_marks_oversize():
+def test_chunk_builder_keeps_overlap_and_marks_oversize() -> None:
     markdown = """
 # Chapter 1
 
@@ -53,3 +54,37 @@ Another paragraph here. More details follow. Even more detail appears now.
     assert len(chunks) >= 2
     assert chunks[0].breadcrumb[0] == "Chapter 1"
     assert all(chunk.text.startswith("_Path:") for chunk in chunks)
+    assert all("_Pages:" in chunk.text for chunk in chunks)
+
+
+def test_clean_markdown_document_rewraps_text_and_drops_page_markers() -> None:
+    messy = """
+Report title
+
+This is a bro-
+ken paragraph that spans
+multiple lines.
+
+Page 12
+""".strip()
+
+    cleaned = pipeline._clean_markdown_document(messy, aggressive=True)
+
+    assert "broken paragraph that spans multiple lines." in cleaned
+    assert "Page 12" not in cleaned
+
+
+def test_tokenizer_falls_back_to_offline_approximation(monkeypatch) -> None:
+    monkeypatch.setattr(pipeline, "_TOKENIZER_CACHE", None)
+
+    def fail_encoding(_: str):
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(pipeline.tiktoken, "get_encoding", fail_encoding)
+
+    tokenizer = pipeline._get_tokenizer()
+    pieces = pipeline._split_text_by_tokens("alpha beta gamma delta", 2)
+
+    assert tokenizer.approximate is True
+    assert tokenizer.name == "approx-wordpieces-v1"
+    assert pieces == ["alpha beta", "gamma delta"]

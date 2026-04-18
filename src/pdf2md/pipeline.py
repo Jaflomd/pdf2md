@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import re
 import shutil
 import subprocess
 import tempfile
+from collections import Counter
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +21,15 @@ from slugify import slugify
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 LIST_RE = re.compile(r"^\s*(?:[-+*]|\d+\.)\s+")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(])")
-SUPPORTED_INPUTS = {".pdf", ".epub", ".azw3"}
+APPROX_TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+PAGE_MARKER_RE = re.compile(
+    r"^(?:page|pagina|página|pag\.?|p\.)?\s*[\divxlcdm]+(?:\s*(?:/|of|de)\s*[\divxlcdm]+)?$",
+    re.IGNORECASE,
+)
+EDGE_DIGIT_RE = re.compile(r"\d+")
+SPLIT_MODES = {"auto", "chapters", "pages"}
+SUPPORTED_INPUTS = {".pdf", ".epub", ".azw3", ".docx"}
+DOCLING_DIRECT_INPUTS = {"pdf", "docx"}
 
 
 class Pdf2MdError(RuntimeError):
@@ -42,6 +54,8 @@ class PreparedInput:
     working_path: Path
     input_format: str
     processing_format: str
+    source_hash: str
+    bundle_name: str
     notes: list[str]
     tempdir: tempfile.TemporaryDirectory[str] | None = None
 
@@ -102,19 +116,35 @@ class ConversionResult:
     manifest: dict[str, Any]
 
 
+@dataclass
+class TokenizerState:
+    name: str
+    approximate: bool
+    encoder: tiktoken.Encoding | None = None
+
+
 def run_conversion(
     input_path: Path,
     outdir: Path,
     chunk_target: int = 1000,
     chunk_overlap: int = 120,
     engine: str = "auto",
+    fast_mode: bool = False,
+    page_group_size: int = 30,
+    split_mode: str = "auto",
+    output_name: str | None = None,
 ) -> ConversionResult:
     if chunk_target <= 0:
         raise Pdf2MdError("--chunk-target must be positive.")
     if chunk_overlap < 0:
         raise Pdf2MdError("--chunk-overlap cannot be negative.")
+    if page_group_size <= 0:
+        raise Pdf2MdError("--page-group-size must be positive.")
+    if split_mode not in SPLIT_MODES:
+        supported = ", ".join(sorted(SPLIT_MODES))
+        raise Pdf2MdError(f"--split-mode must be one of: {supported}")
 
-    prepared = _prepare_input(input_path)
+    prepared = _prepare_input(input_path, output_name=output_name)
     try:
         if prepared.processing_format == "pdf" and _looks_scanned(prepared.working_path):
             raise ScannedDocumentError(
@@ -123,16 +153,41 @@ def run_conversion(
 
         info = _collect_document_info(prepared.working_path)
         page_chunks = _extract_page_chunks(prepared.working_path)
+        page_chunks, cleanup_notes = _clean_page_chunks(page_chunks)
 
         warnings = list(prepared.notes)
-        full_markdown, full_engine, fallback_used, heading_hints = _extract_full_markdown(
-            prepared=prepared,
-            page_chunks=page_chunks,
-            requested_engine=engine,
-            warnings=warnings,
+        warnings.extend(cleanup_notes)
+
+        resolved_split_mode = "pages" if fast_mode else split_mode
+        requested_engine = engine
+        if fast_mode and engine != "pymupdf4llm":
+            warnings.append(f"Fast mode ignored requested engine '{engine}' to prioritize speed.")
+            requested_engine = "pymupdf4llm"
+
+        if fast_mode:
+            full_markdown = _join_page_chunks(page_chunks)
+            if not full_markdown.strip():
+                raise ExtractionError("PyMuPDF4LLM returned empty Markdown.")
+            full_engine = "pymupdf4llm"
+            fallback_used = False
+            heading_hints: list[dict[str, Any]] = []
+            warnings.append(
+                f"Fast mode used PyMuPDF4LLM only and grouped sections every {page_group_size} pages."
+            )
+        else:
+            full_markdown, full_engine, fallback_used, heading_hints = _extract_full_markdown(
+                prepared=prepared,
+                page_chunks=page_chunks,
+                requested_engine=requested_engine,
+                warnings=warnings,
+            )
+
+        full_markdown = _clean_markdown_document(
+            full_markdown,
+            aggressive=full_engine == "pymupdf4llm",
         )
 
-        chapters = _build_chapters(
+        detected_chapters = _build_chapters(
             full_markdown=full_markdown,
             toc=info.toc,
             page_chunks=page_chunks,
@@ -140,7 +195,40 @@ def run_conversion(
             heading_hints=heading_hints,
         )
 
-        tokenizer_name, _ = _get_encoder()
+        if resolved_split_mode == "pages":
+            chapters = _build_page_batch_chapters(page_chunks=page_chunks, page_group_size=page_group_size)
+            if chapters:
+                segmentation_mode = "page-batch"
+            else:
+                chapters = [_build_document_chapter(full_markdown, page_chunks)]
+                segmentation_mode = "document"
+        else:
+            chapters = detected_chapters
+            if chapters:
+                segmentation_mode = "chapters"
+            elif resolved_split_mode == "auto":
+                chapters = _build_page_batch_chapters(page_chunks=page_chunks, page_group_size=page_group_size)
+                if chapters:
+                    segmentation_mode = "page-batch"
+                    warnings.append(
+                        f"No confident chapter boundaries were detected; fell back to {page_group_size}-page sections."
+                    )
+                else:
+                    chapters = [_build_document_chapter(full_markdown, page_chunks)]
+                    segmentation_mode = "document"
+            else:
+                chapters = [_build_document_chapter(full_markdown, page_chunks)]
+                segmentation_mode = "document"
+                warnings.append("No confident chapter boundaries were detected; wrote a single document section.")
+
+        tokenizer = _get_tokenizer()
+        if tokenizer.approximate:
+            approx_warning = (
+                f"Using offline approximate token sizing via {tokenizer.name}; install cached tiktoken data for exact counts."
+            )
+            if approx_warning not in warnings:
+                warnings.append(approx_warning)
+
         all_chunks: list[ChunkRecord] = []
         for chapter in chapters:
             chapter_chunks = _build_chunks_for_chapter(
@@ -151,21 +239,26 @@ def run_conversion(
             chapter.chunk_count = len(chapter_chunks)
             all_chunks.extend(chapter_chunks)
 
-        output_root = outdir / input_path.stem
+        output_root = outdir / prepared.bundle_name
         manifest = _write_outputs(
             output_root=output_root,
             prepared=prepared,
             info=info,
             full_markdown=full_markdown,
             full_engine=full_engine,
-            requested_engine=engine,
+            requested_engine=requested_engine,
             fallback_used=fallback_used,
             chunk_target=chunk_target,
             chunk_overlap=chunk_overlap,
-            tokenizer_name=tokenizer_name,
+            tokenizer_name=tokenizer.name,
+            tokenizer_approximate=tokenizer.approximate,
             chapters=chapters,
             chunks=all_chunks,
             warnings=warnings,
+            fast_mode=fast_mode,
+            page_group_size=page_group_size if segmentation_mode == "page-batch" else None,
+            split_mode=resolved_split_mode,
+            segmentation_mode=segmentation_mode,
         )
         return ConversionResult(output_root=output_root, manifest=manifest)
     finally:
@@ -173,7 +266,7 @@ def run_conversion(
             prepared.tempdir.cleanup()
 
 
-def _prepare_input(input_path: Path) -> PreparedInput:
+def _prepare_input(input_path: Path, output_name: str | None = None) -> PreparedInput:
     path = input_path.expanduser().resolve()
     if not path.exists():
         raise Pdf2MdError(f"Input file does not exist: {path}")
@@ -182,6 +275,9 @@ def _prepare_input(input_path: Path) -> PreparedInput:
     if suffix not in SUPPORTED_INPUTS:
         supported = ", ".join(sorted(SUPPORTED_INPUTS))
         raise UnsupportedInputError(f"Unsupported input format '{suffix}'. Supported: {supported}")
+
+    source_hash = _hash_file(path)
+    bundle_name = _build_bundle_name(path=path, source_hash=source_hash, output_name=output_name)
 
     if suffix == ".azw3":
         converter = shutil.which("ebook-convert")
@@ -206,6 +302,8 @@ def _prepare_input(input_path: Path) -> PreparedInput:
             working_path=epub_path,
             input_format="azw3",
             processing_format="epub",
+            source_hash=source_hash,
+            bundle_name=bundle_name,
             notes=["Converted AZW3 to EPUB via Calibre before Markdown extraction."],
             tempdir=tempdir,
         )
@@ -215,6 +313,8 @@ def _prepare_input(input_path: Path) -> PreparedInput:
         working_path=path,
         input_format=suffix.lstrip("."),
         processing_format=suffix.lstrip("."),
+        source_hash=source_hash,
+        bundle_name=bundle_name,
         notes=[],
     )
 
@@ -278,8 +378,11 @@ def _extract_full_markdown(
 ) -> tuple[str, str, bool, list[dict[str, Any]]]:
     processing_format = prepared.processing_format
 
-    if requested_engine == "docling" and processing_format != "pdf":
-        raise UnsupportedInputError("The docling engine in this tool only supports PDF inputs.")
+    if requested_engine == "docling" and processing_format not in DOCLING_DIRECT_INPUTS:
+        supported = ", ".join(sorted(DOCLING_DIRECT_INPUTS))
+        raise UnsupportedInputError(
+            f"The docling engine in this tool supports only: {supported}."
+        )
 
     if processing_format == "epub":
         markdown = _join_page_chunks(page_chunks)
@@ -309,9 +412,7 @@ def _extract_full_markdown(
 
 
 def _extract_full_markdown_with_docling(path: Path) -> tuple[str, list[dict[str, Any]]]:
-    from docling.document_converter import DocumentConverter
-
-    converter = DocumentConverter()
+    converter = _get_docling_converter()
     result = converter.convert(str(path))
     markdown = result.document.export_to_markdown()
     heading_hints: list[dict[str, Any]] = []
@@ -336,6 +437,13 @@ def _extract_full_markdown_with_docling(path: Path) -> tuple[str, list[dict[str,
             }
         )
     return markdown.strip(), heading_hints
+
+
+@lru_cache(maxsize=1)
+def _get_docling_converter():
+    from docling.document_converter import DocumentConverter
+
+    return DocumentConverter()
 
 
 def _join_page_chunks(page_chunks: list[PageChunk]) -> str:
@@ -363,17 +471,59 @@ def _build_chapters(
     if chapters:
         return chapters
 
-    return [
-        Chapter(
-            index=0,
-            title="Document",
-            slug="document",
-            markdown=full_markdown.strip() + "\n",
-            page_start=1,
-            page_end=max(1, len(page_chunks)),
-            origin="document",
+    return []
+
+
+def _build_document_chapter(full_markdown: str, page_chunks: list[PageChunk]) -> Chapter:
+    return Chapter(
+        index=0,
+        title="Document",
+        slug="document",
+        markdown=full_markdown.strip() + "\n",
+        page_start=1,
+        page_end=max(1, len(page_chunks)),
+        origin="document",
+    )
+
+
+def _build_page_batch_chapters(page_chunks: list[PageChunk], page_group_size: int) -> list[Chapter]:
+    if not page_chunks:
+        return []
+
+    chapters: list[Chapter] = []
+    next_index = 1
+    ordered_chunks = list(page_chunks)
+    for start_index in range(0, len(ordered_chunks), page_group_size):
+        batch = ordered_chunks[start_index : start_index + page_group_size]
+        if not batch:
+            continue
+        start_page = int(batch[0].page_number)
+        end_page = int(batch[-1].page_number)
+        markdown = "\n\n".join(chunk.text.strip() for chunk in batch if chunk.text.strip()).strip()
+        if not markdown:
+            continue
+
+        if start_page == end_page:
+            title = f"Page {start_page}"
+            slug = f"page-{start_page:03d}"
+        else:
+            title = f"Pages {start_page}-{end_page}"
+            slug = f"pages-{start_page:03d}-{end_page:03d}"
+
+        chapters.append(
+            Chapter(
+                index=next_index,
+                title=title,
+                slug=slug,
+                markdown=markdown + "\n",
+                page_start=start_page,
+                page_end=end_page,
+                origin="page-batch",
+            )
         )
-    ]
+        next_index += 1
+
+    return chapters
 
 
 def _build_chapters_from_toc(toc: list[dict[str, Any]], page_chunks: list[PageChunk]) -> list[Chapter]:
@@ -496,7 +646,7 @@ def _build_chapters_from_headings(
         if not markdown:
             continue
 
-        page_start = inferred_pages[idx] or (chapters[-1].page_end if chapters else 1)
+        page_start = inferred_pages[idx] or (chapters[-1].page_end + 1 if chapters else 1)
         next_page = None
         for candidate in inferred_pages[idx + 1 :]:
             if candidate is not None and candidate >= page_start:
@@ -640,10 +790,14 @@ def _render_chunk_record(
 ) -> ChunkRecord:
     breadcrumb = _dedupe_path(blocks[0].path if blocks else [chapter.title])
     body = "\n\n".join(block.text.strip() for block in blocks if block.text.strip()).strip()
+    metadata_lines = [
+        f"_Path: {' > '.join(breadcrumb)}_",
+        f"_Pages: {chapter.page_start}-{chapter.page_end} | Chunk: {chunk_index:04d}_",
+    ]
     if body:
-        text = f"_Path: {' > '.join(breadcrumb)}_\n\n{body}\n"
+        text = "\n".join(metadata_lines) + f"\n\n{body}\n"
     else:
-        text = f"_Path: {' > '.join(breadcrumb)}_\n"
+        text = "\n".join(metadata_lines) + "\n"
 
     return ChunkRecord(
         chapter_index=chapter.index,
@@ -812,14 +966,8 @@ def _finalize_split_piece(block: Block, text: str, chunk_target: int) -> list[Bl
 
 
 def _slice_block_by_tokens(block: Block, chunk_target: int) -> list[Block]:
-    tokenizer_name, encoder = _get_encoder()
-    _ = tokenizer_name
-    encoded = encoder.encode(block.text)
     pieces: list[Block] = []
-    start = 0
-    while start < len(encoded):
-        stop = min(len(encoded), start + chunk_target)
-        text = encoder.decode(encoded[start:stop]).strip()
+    for text in _split_text_by_tokens(block.text, chunk_target):
         if text:
             pieces.append(
                 Block(
@@ -830,7 +978,6 @@ def _slice_block_by_tokens(block: Block, chunk_target: int) -> list[Block]:
                     heading_level=block.heading_level,
                 )
             )
-        start = stop
     return pieces or [block]
 
 
@@ -844,11 +991,18 @@ def _write_outputs(
     fallback_used: bool,
     chunk_target: int,
     chunk_overlap: int,
-    tokenizer_name: str,
+    tokenizer_name: str | None,
+    tokenizer_approximate: bool,
     chapters: list[Chapter],
     chunks: list[ChunkRecord],
     warnings: list[str],
+    fast_mode: bool,
+    page_group_size: int | None,
+    split_mode: str,
+    segmentation_mode: str,
 ) -> dict[str, Any]:
+    if output_root.exists():
+        shutil.rmtree(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     chapters_dir = output_root / "chapters"
     chunks_dir = output_root / "chunks"
@@ -870,7 +1024,7 @@ def _write_outputs(
         chapter_dir = chunks_dir / f"{chapter.index:02d}-{chapter.slug}"
         chapter_dir.mkdir(parents=True, exist_ok=True)
         for chunk in chunk_lookup.get(chapter.index, []):
-            chunk.relative_path = str(Path("chunks") / chapter_dir.name / f"{chunk.chunk_index:04d}.md")
+            chunk.relative_path = str(Path("chunks") / chapter_dir.name / f"chunk-{chunk.chunk_index:04d}.md")
             (output_root / chunk.relative_path).write_text(chunk.text, encoding="utf-8")
 
     index_path = chunks_dir / "index.jsonl"
@@ -900,8 +1054,13 @@ def _write_outputs(
             "processing_path": str(prepared.working_path),
             "input_format": prepared.input_format,
             "processing_format": prepared.processing_format,
+            "sha256": prepared.source_hash,
             "page_count": info.page_count,
             "metadata": info.metadata,
+        },
+        "output": {
+            "bundle_name": prepared.bundle_name,
+            "root_path": str(output_root),
         },
         "engine": {
             "requested": requested_engine,
@@ -909,10 +1068,18 @@ def _write_outputs(
             "page_engine": "pymupdf4llm",
             "fallback_used": fallback_used,
         },
+        "processing": {
+            "fast_mode": fast_mode,
+            "split_mode": split_mode,
+            "page_group_size": page_group_size,
+            "segmentation_mode": segmentation_mode,
+        },
         "chunking": {
+            "enabled": bool(chunks),
             "target_tokens": chunk_target,
             "overlap_tokens": chunk_overlap,
             "tokenizer": tokenizer_name,
+            "approximate": tokenizer_approximate,
         },
         "chapters": [
             {
@@ -943,6 +1110,260 @@ def _join_page_range(page_chunks: list[PageChunk], start_page: int, end_page: in
         if start_page <= page_chunk.page_number <= end_page and page_chunk.text.strip()
     ]
     return "\n\n".join(snippets).strip() + "\n" if snippets else ""
+
+
+def _hash_file(path: Path, block_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(block_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _build_bundle_name(path: Path, source_hash: str, output_name: str | None) -> str:
+    requested_name = Path(output_name).stem if output_name else path.stem
+    clean_name = _clean_title(requested_name, "document")
+    slug = _make_slug(clean_name, "document")
+    return f"{slug}--{source_hash[:10]}"
+
+
+def _clean_page_chunks(page_chunks: list[PageChunk]) -> tuple[list[PageChunk], list[str]]:
+    if not page_chunks:
+        return [], []
+
+    repeated_top, repeated_bottom = _detect_repeated_edge_lines(page_chunks)
+    cleaned_chunks: list[PageChunk] = []
+    warnings: list[str] = []
+    stripped_pages = 0
+
+    for chunk in page_chunks:
+        cleaned_text, stripped_any = _clean_single_page_chunk(
+            chunk.text,
+            repeated_top=repeated_top,
+            repeated_bottom=repeated_bottom,
+        )
+        if stripped_any:
+            stripped_pages += 1
+        cleaned_chunks.append(
+            PageChunk(
+                page_number=chunk.page_number,
+                text=cleaned_text,
+                metadata=dict(chunk.metadata),
+            )
+        )
+
+    if repeated_top or repeated_bottom:
+        warnings.append("Removed repeated running headers or footers from extracted page Markdown.")
+    if stripped_pages:
+        warnings.append(f"Stripped likely page markers from {stripped_pages} extracted pages.")
+    return cleaned_chunks, warnings
+
+
+def _detect_repeated_edge_lines(page_chunks: list[PageChunk]) -> tuple[set[str], set[str]]:
+    page_count = len(page_chunks)
+    if page_count < 3:
+        return set(), set()
+
+    threshold = max(3, math.ceil(page_count * 0.35))
+    top_counts: Counter[str] = Counter()
+    bottom_counts: Counter[str] = Counter()
+
+    for chunk in page_chunks:
+        lines = [line.strip() for line in chunk.text.splitlines() if line.strip()]
+        for line in lines[:2]:
+            normalized = _normalize_edge_line(line)
+            if normalized:
+                top_counts[normalized] += 1
+        for line in lines[-2:]:
+            normalized = _normalize_edge_line(line)
+            if normalized:
+                bottom_counts[normalized] += 1
+
+    repeated_top = {line for line, count in top_counts.items() if count >= threshold}
+    repeated_bottom = {line for line, count in bottom_counts.items() if count >= threshold}
+    return repeated_top, repeated_bottom
+
+
+def _clean_single_page_chunk(
+    text: str,
+    repeated_top: set[str],
+    repeated_bottom: set[str],
+) -> tuple[str, bool]:
+    raw_lines = _normalize_unicode_text(text).splitlines()
+    cleaned_lines = list(raw_lines)
+    nonempty_indexes = [index for index, line in enumerate(cleaned_lines) if line.strip()]
+    stripped_any = False
+
+    for index in nonempty_indexes[:2]:
+        stripped = cleaned_lines[index].strip()
+        normalized = _normalize_edge_line(stripped)
+        if normalized and (normalized in repeated_top or _is_page_marker_line(stripped)):
+            cleaned_lines[index] = ""
+            stripped_any = True
+
+    for index in reversed(nonempty_indexes[-2:]):
+        stripped = cleaned_lines[index].strip()
+        normalized = _normalize_edge_line(stripped)
+        if normalized and (normalized in repeated_bottom or _is_page_marker_line(stripped)):
+            cleaned_lines[index] = ""
+            stripped_any = True
+
+    cleaned_text = _clean_markdown_document("\n".join(cleaned_lines), aggressive=True)
+    return cleaned_text, stripped_any
+
+
+def _clean_markdown_document(text: str, aggressive: bool) -> str:
+    normalized = _normalize_unicode_text(text)
+    normalized = re.sub(r"[ \t]+\n", "\n", normalized)
+    normalized = re.sub(r"\n[ \t]+", "\n", normalized)
+    normalized = re.sub(r"(?<=\w)-\n(?=\w)", "", normalized)
+
+    output_lines: list[str] = []
+    prose_buffer: list[str] = []
+    in_code_block = False
+    active_fence: str | None = None
+
+    for raw_line in normalized.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+
+        if not stripped:
+            _flush_prose_buffer(output_lines, prose_buffer)
+            if output_lines and output_lines[-1] != "":
+                output_lines.append("")
+            continue
+
+        fence = _code_fence(stripped)
+        if fence:
+            _flush_prose_buffer(output_lines, prose_buffer)
+            output_lines.append(stripped)
+            if in_code_block and fence == active_fence:
+                in_code_block = False
+                active_fence = None
+            else:
+                in_code_block = True
+                active_fence = fence
+            continue
+
+        if in_code_block:
+            output_lines.append(line)
+            continue
+
+        line = _normalize_list_marker(line)
+        stripped = line.strip()
+
+        if _is_page_marker_line(stripped):
+            continue
+
+        if aggressive and _looks_like_noise_line(stripped):
+            continue
+
+        if _is_structural_line(stripped):
+            _flush_prose_buffer(output_lines, prose_buffer)
+            output_lines.append(line.rstrip())
+            continue
+
+        prose_buffer.append(stripped)
+
+    _flush_prose_buffer(output_lines, prose_buffer)
+
+    text_out = "\n".join(output_lines)
+    text_out = re.sub(r"\n{3,}", "\n\n", text_out).strip()
+    return text_out + "\n" if text_out else ""
+
+
+def _normalize_unicode_text(text: str) -> str:
+    replacements = {
+        "\r\n": "\n",
+        "\r": "\n",
+        "\u00a0": " ",
+        "\u2007": " ",
+        "\u202f": " ",
+        "\ufb00": "ff",
+        "\ufb01": "fi",
+        "\ufb02": "fl",
+        "\ufb03": "ffi",
+        "\ufb04": "ffl",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2013": "-",
+        "\u2014": "-",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+def _normalize_edge_line(text: str) -> str:
+    cleaned = _normalize_unicode_text(text).strip(" -|_")
+    if not cleaned or len(cleaned) < 3 or len(cleaned) > 120:
+        return ""
+    word_count = len(cleaned.split())
+    if word_count > 8:
+        return ""
+    if cleaned.endswith((".", "!", "?", ";", ":")) and word_count > 2:
+        return ""
+    collapsed = re.sub(r"\s+", " ", cleaned).strip().lower()
+    collapsed = EDGE_DIGIT_RE.sub("#", collapsed)
+    collapsed = re.sub(r"[^a-z0-9# ]+", "", collapsed)
+    return collapsed.strip()
+
+
+def _normalize_list_marker(line: str) -> str:
+    return re.sub(r"^(\s*)([•◦▪‣·])\s+", r"\1- ", line)
+
+
+def _looks_like_noise_line(line: str) -> bool:
+    if len(line) > 120:
+        return False
+    lowered = line.casefold()
+    if lowered.startswith("confidential") or lowered.startswith("copyright"):
+        return True
+    return False
+
+
+def _is_page_marker_line(line: str) -> bool:
+    return bool(PAGE_MARKER_RE.match(line.strip()))
+
+
+def _is_structural_line(stripped_line: str) -> bool:
+    return bool(
+        HEADING_RE.match(stripped_line)
+        or _is_table_line(stripped_line)
+        or LIST_RE.match(stripped_line)
+        or stripped_line.startswith("> ")
+        or stripped_line in {"---", "***", "___"}
+    )
+
+
+def _flush_prose_buffer(output_lines: list[str], prose_buffer: list[str]) -> None:
+    if not prose_buffer:
+        return
+    paragraph = _join_prose_lines(prose_buffer)
+    prose_buffer.clear()
+    if paragraph:
+        output_lines.append(paragraph)
+
+
+def _join_prose_lines(lines: list[str]) -> str:
+    paragraph = ""
+    for line in lines:
+        if not paragraph:
+            paragraph = line.strip()
+            continue
+        if paragraph.endswith("-") and line[:1].isalnum():
+            paragraph = paragraph[:-1] + line.lstrip()
+        else:
+            paragraph = f"{paragraph} {line.lstrip()}"
+    paragraph = re.sub(r"\s+([,.;:!?])", r"\1", paragraph)
+    paragraph = re.sub(r"([(\[])\s+", r"\1", paragraph)
+    paragraph = re.sub(r"\s+([)\]])", r"\1", paragraph)
+    return re.sub(r"\s{2,}", " ", paragraph).strip()
 
 
 def _clean_title(title: str, fallback: str) -> str:
@@ -983,22 +1404,62 @@ def _code_fence(stripped_line: str) -> str | None:
     return None
 
 
-_ENCODER_CACHE: tuple[str, tiktoken.Encoding] | None = None
+_TOKENIZER_CACHE: TokenizerState | None = None
 
 
-def _get_encoder() -> tuple[str, tiktoken.Encoding]:
-    global _ENCODER_CACHE
-    if _ENCODER_CACHE is not None:
-        return _ENCODER_CACHE
+def _get_tokenizer() -> TokenizerState:
+    global _TOKENIZER_CACHE
+    if _TOKENIZER_CACHE is not None:
+        return _TOKENIZER_CACHE
     for encoding_name in ("o200k_base", "cl100k_base"):
         try:
-            _ENCODER_CACHE = (encoding_name, tiktoken.get_encoding(encoding_name))
-            return _ENCODER_CACHE
-        except KeyError:
+            encoder = tiktoken.get_encoding(encoding_name)
+            _TOKENIZER_CACHE = TokenizerState(
+                name=encoding_name,
+                approximate=False,
+                encoder=encoder,
+            )
+            return _TOKENIZER_CACHE
+        except Exception:  # noqa: BLE001 - offline use should gracefully fall back.
             continue
-    raise Pdf2MdError("No supported tokenizer encoding found in tiktoken.")
+    _TOKENIZER_CACHE = TokenizerState(name="approx-wordpieces-v1", approximate=True, encoder=None)
+    return _TOKENIZER_CACHE
+
+
+def _split_text_by_tokens(text: str, chunk_target: int) -> list[str]:
+    tokenizer = _get_tokenizer()
+    if tokenizer.encoder is not None:
+        encoded = tokenizer.encoder.encode(text, disallowed_special=())
+        pieces: list[str] = []
+        start = 0
+        while start < len(encoded):
+            stop = min(len(encoded), start + chunk_target)
+            piece = tokenizer.encoder.decode(encoded[start:stop]).strip()
+            if piece:
+                pieces.append(piece)
+            start = stop
+        return pieces
+
+    spans = [match.span() for match in APPROX_TOKEN_RE.finditer(text)]
+    if not spans:
+        stripped = text.strip()
+        return [stripped] if stripped else []
+
+    pieces = []
+    start_token = 0
+    while start_token < len(spans):
+        stop_token = min(len(spans), start_token + chunk_target)
+        start_char = spans[start_token][0]
+        end_char = spans[stop_token - 1][1]
+        piece = text[start_char:end_char].strip()
+        if piece:
+            pieces.append(piece)
+        start_token = stop_token
+    return pieces
 
 
 def _count_tokens(text: str) -> int:
-    _, encoder = _get_encoder()
-    return len(encoder.encode(text, disallowed_special=()))
+    tokenizer = _get_tokenizer()
+    if tokenizer.encoder is not None:
+        return len(tokenizer.encoder.encode(text, disallowed_special=()))
+    return len(APPROX_TOKEN_RE.findall(text))

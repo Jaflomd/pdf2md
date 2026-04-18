@@ -6,6 +6,7 @@
 - `chapters/*.md` por capítulos
 - `chunks/**/*.md` para RAG o agentes
 - `manifest.json` y `chunks/index.jsonl` con metadata liviana
+- carpeta de salida determinística: `<outdir>/<slug>--<sha256-corto>/`
 
 La app ahora tiene dos modos:
 
@@ -18,6 +19,7 @@ Todo corre localmente, sin llamadas LLM ni OCR en v1.
 
 - `PDF`: soportado
 - `EPUB`: soportado
+- `Word (.docx)`: soportado
 - `AZW3`: soporte opcional si existe `ebook-convert` de Calibre; si no, el flujo falla con un mensaje claro
 
 ## Instalación
@@ -44,6 +46,7 @@ La interfaz permite:
 
 - subir un documento
 - elegir el engine
+- activar `Fast Mode` para dividir el documento cada `N` páginas
 - ajustar chunk target y overlap
 - previsualizar `document.md`
 - descargar `document.md`
@@ -53,15 +56,23 @@ La interfaz permite:
 
 ```bash
 python -m pdf2md ./libro.pdf --outdir ./outputs
-python -m pdf2md ./book.epub --engine pymupdf4llm
+python -m pdf2md ./book.epub --engine pymupdf4llm --split auto
+python -m pdf2md ./manual.pdf --split pages --page-group-size 20
+python -m pdf2md ./reporte.pdf --name reporte-finanzas --json
+python -m pdf2md ./manual.pdf --fast-mode
 ```
 
 Opciones principales:
 
 - `--outdir`: carpeta base de salida
+- `--name`: prefijo opcional del bundle; igual se agrega hash de contenido
+- `--split`: `auto`, `chapters`, `pages`
 - `--chunk-target`: objetivo de tokens por chunk, default `1000`
 - `--chunk-overlap`: overlap por chunk, default `120`
 - `--engine`: `auto`, `docling`, `pymupdf4llm`
+- `--page-group-size`: páginas por archivo Markdown cuando el split termina en grupos por página
+- `--fast-mode`: shortcut de compatibilidad para `--engine pymupdf4llm --split pages`
+- `--json`: imprime un resumen compacto para automatización
 
 ## Notas de diseño
 
@@ -69,6 +80,10 @@ Opciones principales:
 - `PyMuPDF4LLM` produce el slicing por página y sirve como fallback.
 - Para `EPUB`, el flujo usa `PyMuPDF4LLM` como extractor principal porque `Docling` no lo soporta nativamente.
 - Si un PDF parece escaneado, el proceso aborta: v1 no hace OCR.
+- El split `auto` intenta detectar capítulos por TOC o headings y, si no puede, cae a grupos por páginas.
+- `Fast Mode` sigue generando chunks; no solo archivos por páginas.
+- El pipeline limpia varios problemas comunes de PDFs: headers/footers repetidos, números de página sueltos, guiones de fin de línea y saltos raros dentro de párrafos.
+- Si `tiktoken` no tiene encodings cacheados, el chunking cae a un contador offline aproximado para que el flujo siga funcionando sin red.
 
 ## Publicarlo desde GitHub
 
