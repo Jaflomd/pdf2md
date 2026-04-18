@@ -109,3 +109,21 @@ Fuentes:
 - [Deploy your app on Community Cloud](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy)
 - [App dependencies for your Community Cloud app](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/app-dependencies)
 - [Connect your GitHub account](https://docs.streamlit.io/deploy/streamlit-community-cloud/get-started/connect-your-github-account)
+
+## Deploy Free en Render
+
+Este repo también quedó listo para desplegarse gratis en Render desde GitHub con [render.yaml](/Users/jaflomd/Library/Mobile%20Documents/com~apple~CloudDocs/Jaflo%20OS/6%20Development/pdf2md/render.yaml).
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Jaflomd/pdf2md/tree/main)
+
+La configuración usa:
+
+- `plan: free`
+- `buildCommand: pip install -r requirements.txt`
+- `startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true`
+
+Notas importantes según la documentación oficial:
+
+- GitHub Pages no sirve para esta app porque es hosting estático de `HTML/CSS/JS`, y aquí necesitamos Python en servidor: [GitHub Pages](https://docs.github.com/es/pages/getting-started-with-github-pages/about-github-pages)
+- Render Free sí corre apps Python, pero hace spin down tras `15 minutos` sin tráfico: [Render Free](https://render.com/docs/free)
+- Cada servicio web en Render recibe una URL pública `*.onrender.com`: [Render Web Services](https://render.com/docs/web-services)
